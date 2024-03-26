@@ -48,6 +48,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -236,14 +237,14 @@ class BulkIngesterTest extends Assertions {
         };
 
         BulkIngester<Void> ingester = BulkIngester.of(b -> b
-            .client(new ElasticsearchAsyncClient(transport))
-            // Flush every 50 ms
-            .flushInterval(50, TimeUnit.MILLISECONDS)
-            // Disable other flushing limits
-            .maxSize(-1)
-            .maxOperations(-1)
-            .maxConcurrentRequests(Integer.MAX_VALUE)
-            .listener(listener)
+                .client(new ElasticsearchAsyncClient(transport))
+                // Flush every 50 ms
+                .flushInterval(50, TimeUnit.MILLISECONDS)
+                // Disable other flushing limits
+                .maxSize(-1)
+                .maxOperations(-1)
+                .maxConcurrentRequests(Integer.MAX_VALUE)
+                .listener(listener)
         );
 
         // Add an operation every 100 ms to give time
@@ -322,6 +323,69 @@ class BulkIngesterTest extends Assertions {
                     assertEquals(contexts.get(j), i*10 + j);
                 }
             }
+        }
+    }
+
+    @Test
+    public void stopOnFail() throws Exception {
+        TestTransport transport = new TestTransport();
+        List<BulkRequest> allRequests = Collections.synchronizedList(new ArrayList<>());
+        List<List<Integer>> allContexts = Collections.synchronizedList(new ArrayList<>());
+        List<Integer> activeContexts = Collections.synchronizedList(new ArrayList<>());
+        AtomicBoolean stop = new AtomicBoolean(false);
+        BulkListener<Integer> listener = new BulkListener<Integer>() {
+            @Override
+            public void beforeBulk(long executionId, BulkRequest request, List<Integer> contexts) {
+                allRequests.add(request);
+                allContexts.add(contexts);
+                stop.set(true);
+            }
+
+            @Override
+            public void afterBulk(long executionId, BulkRequest request, List<Integer> contexts, BulkResponse response) {
+                activeContexts.removeAll(contexts);
+                stop.set(false);
+
+            }
+
+            @Override
+            public void afterBulk(long executionId, BulkRequest request, List<Integer> contexts, Throwable failure) {
+            }
+        };
+
+        BulkIngester<Integer> ingester = BulkIngester.of(b -> b
+                .client(new ElasticsearchAsyncClient(transport))
+                // Split every 10 operations
+                .maxOperations(10)
+                .maxConcurrentRequests(0)
+
+                .listener(listener)
+        );
+
+        for (int i = 0; i < 10; i++) {
+            for (int j = 0; j < 10; j++) {
+                // Set a context only after 5, so that we test filling with nulls.
+                Integer context = (i * 10 + j) % 7;
+                if (activeContexts.contains(context)) {
+                    ingester.flush();
+                }
+                if(!stop.get()) {
+                    activeContexts.add(context);
+                    ingester.add(operation, context);
+                } else {
+                    fail();
+                }
+            }
+        }
+
+        ingester.close();
+        transport.close();
+        System.out.println("Contexts: " + allContexts);
+        // We should have 10 operations per request but only 5 requests
+        assertEquals(100, ingester.operationsCount());
+
+        for (List<Integer> contexts: allContexts) {
+            assertEquals(contexts.stream().distinct().count(), contexts.size());
         }
     }
 
@@ -443,7 +507,7 @@ class BulkIngesterTest extends Assertions {
         });
 
         assertThrows(IllegalArgumentException.class, () -> {
-            b.maxConcurrentRequests(0);
+            b.maxConcurrentRequests(-1);
         });
 
         assertThrows(IllegalArgumentException.class, () -> {

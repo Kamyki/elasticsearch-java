@@ -19,6 +19,25 @@
 
 package co.elastic.clients.elasticsearch._helpers.bulk;
 
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Function;
+
+import javax.annotation.Nullable;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
 import co.elastic.clients.elasticsearch.ElasticsearchAsyncClient;
 import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch.core.BulkRequest;
@@ -27,22 +46,6 @@ import co.elastic.clients.elasticsearch.core.bulk.BulkOperation;
 import co.elastic.clients.transport.TransportOptions;
 import co.elastic.clients.util.ApiTypeHelper;
 import co.elastic.clients.util.ObjectBuilder;
-import org.apache.commons.logging.Log;
-import org.apache.commons.logging.LogFactory;
-
-import javax.annotation.Nullable;
-import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.CompletionStage;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.locks.ReentrantLock;
-import java.util.function.Function;
 
 public class BulkIngester<Context> implements AutoCloseable {
 
@@ -57,6 +60,7 @@ public class BulkIngester<Context> implements AutoCloseable {
     private final int maxRequests;
     private final long maxSize;
     private final int maxOperations;
+    private final boolean isBlocking;
     private final @Nullable BulkListener<Context> listener;
     private final Long flushIntervalMillis;
 
@@ -94,12 +98,13 @@ public class BulkIngester<Context> implements AutoCloseable {
         int ingesterId = idCounter.incrementAndGet();
         this.client = ApiTypeHelper.requireNonNull(builder.client, this, "client");
         this.globalSettings = builder.globalSettings;
-        this.maxRequests = builder.maxConcurrentRequests;
+        this.maxRequests = builder.maxConcurrentRequests == 0 ? 1 : builder.maxConcurrentRequests;
         this.maxSize = builder.bulkSize < 0 ? Long.MAX_VALUE : builder.bulkSize;
         this.maxOperations = builder.bulkOperations < 0 ? Integer.MAX_VALUE : builder.bulkOperations;
+        this.isBlocking = builder.maxConcurrentRequests == 0;
         this.listener = builder.listener;
         this.flushIntervalMillis = builder.flushIntervalMillis;
-        
+
         if (flushIntervalMillis != null) {
             long flushInterval = flushIntervalMillis;
 
@@ -107,11 +112,11 @@ public class BulkIngester<Context> implements AutoCloseable {
             ScheduledExecutorService scheduler;
             if (builder.scheduler == null) {
                 scheduler = Executors.newSingleThreadScheduledExecutor((r) -> {
-                        Thread t = Executors.defaultThreadFactory().newThread(r);
-                        t.setName("bulk-ingester-flusher#" + ingesterId);
-                        t.setDaemon(true);
-                        return t;
-                    });
+                    Thread t = Executors.defaultThreadFactory().newThread(r);
+                    t.setName("bulk-ingester-flusher#" + ingesterId);
+                    t.setDaemon(true);
+                    return t;
+                });
 
                 // Keep it, we'll have to close it.
                 this.scheduler = scheduler;
@@ -119,11 +124,11 @@ public class BulkIngester<Context> implements AutoCloseable {
                 // It's not ours, we will not close it.
                 scheduler = builder.scheduler;
             }
-            
+
             this.flushTask = scheduler.scheduleWithFixedDelay(
-                this::failsafeFlush,
-                flushInterval, flushInterval,
-                TimeUnit.MILLISECONDS
+                    this::failsafeFlush,
+                    flushInterval, flushInterval,
+                    TimeUnit.MILLISECONDS
             );
         }
     }
@@ -221,7 +226,7 @@ public class BulkIngester<Context> implements AutoCloseable {
      * @see Builder#maxConcurrentRequests
      */
     public long requestContentionsCount() {
-        return  this.sendRequestCondition.contentions();
+        return this.sendRequestCondition.contentions();
     }
 
     //----- Predicates for the condition variables
@@ -246,16 +251,16 @@ public class BulkIngester<Context> implements AutoCloseable {
         if (this.globalSettings != null) {
             BulkRequest settings = this.globalSettings;
             result
-                .index(settings.index())
-                .pipeline(settings.pipeline())
-                .refresh(settings.refresh())
-                .requireAlias(settings.requireAlias())
-                .routing(settings.routing())
-                .sourceExcludes(settings.sourceExcludes())
-                .sourceIncludes(settings.sourceIncludes())
-                .source(settings.source())
-                .timeout(settings.timeout())
-                .waitForActiveShards(settings.waitForActiveShards())
+                    .index(settings.index())
+                    .pipeline(settings.pipeline())
+                    .refresh(settings.refresh())
+                    .requireAlias(settings.requireAlias())
+                    .routing(settings.routing())
+                    .sourceExcludes(settings.sourceExcludes())
+                    .sourceIncludes(settings.sourceIncludes())
+                    .source(settings.source())
+                    .timeout(settings.timeout())
+                    .waitForActiveShards(settings.waitForActiveShards())
             ;
         }
 
@@ -265,7 +270,7 @@ public class BulkIngester<Context> implements AutoCloseable {
     private void failsafeFlush() {
         try {
             flush();
-        } catch(Throwable thr) {
+        } catch (Throwable thr) {
             // Log the error and continue
             logger.error("Error in background flush", thr);
         }
@@ -273,47 +278,43 @@ public class BulkIngester<Context> implements AutoCloseable {
 
     public void flush() {
         RequestExecution<Context> exec = sendRequestCondition.whenReadyIf(
-            () -> {
-                // May happen on manual and periodic flushes
-                return !operations.isEmpty();
-            },
-            () -> {
-                // Build the request
-                BulkRequest request = newRequest().operations(operations).build();
-                List<Context> requestContexts = contexts == null ? Collections.nCopies(operations.size(), null) : contexts;
+                () -> {
+                    // May happen on manual and periodic flushes
+                    return !operations.isEmpty();
+                },
+                () -> {
+                    // Build the request
+                    BulkRequest request = newRequest().operations(operations).build();
+                    List<Context> requestContexts = contexts == null ? Collections.nCopies(operations.size(), null) : contexts;
 
-                // Prepare for next round
-                operations = new ArrayList<>();
-                contexts = null;
-                currentSize = 0;
-                addCondition.signalIfReady();
+                    // Prepare for next round
+                    operations = new ArrayList<>();
+                    contexts = null;
+                    currentSize = 0;
+                    addCondition.signalIfReady();
 
-                long id = sendRequestCondition.invocations();
+                    long id = sendRequestCondition.invocations();
 
-                if (listener != null) {
-                    listener.beforeBulk(id, request, requestContexts);
-                }
+                    if (listener != null) {
+                        listener.beforeBulk(id, request, requestContexts);
+                    }
 
-                CompletionStage<BulkResponse> result = client.bulk(request);
-                requestsInFlightCount++;
+                    CompletionStage<BulkResponse> result = client.bulk(request);
+                    requestsInFlightCount++;
 
-                if (listener == null) {
-                    // No need to keep the request around, it can be GC'ed
-                    request = null;
-                }
+                    if (listener == null) {
+                        // No need to keep the request around, it can be GC'ed
+                        request = null;
+                    }
 
-                return new RequestExecution<>(id, request, requestContexts, result);
-        });
+                    return new RequestExecution<>(id, request, requestContexts, result);
+                });
+
+        CountDownLatch latch = isBlocking ? new CountDownLatch(1) : null;
 
         if (exec != null) {
             // A request was actually sent
             exec.futureResponse.handle((resp, thr) -> {
-
-                sendRequestCondition.signalIfReadyAfter(() -> {
-                    requestsInFlightCount--;
-                    closeCondition.signalAllIfReady();
-                });
-
                 if (resp != null) {
                     // Success
                     if (listener != null) {
@@ -325,8 +326,22 @@ public class BulkIngester<Context> implements AutoCloseable {
                         listener.afterBulk(exec.id, exec.request, exec.contexts, thr);
                     }
                 }
+                if (isBlocking) {
+                    latch.countDown();
+                }
+                sendRequestCondition.signalIfReadyAfter(() -> {
+                    requestsInFlightCount--;
+                    closeCondition.signalAllIfReady();
+                });
                 return null;
             });
+            if (isBlocking) {
+                try {
+                    latch.await();
+                } catch (InterruptedException e) {
+                    logger.error("Interrupted while waiting for flush", e);
+                }
+            }
         }
     }
 
@@ -339,7 +354,7 @@ public class BulkIngester<Context> implements AutoCloseable {
 
         addCondition.whenReady(() -> {
 
-            if (context != null) {
+            if (context != null || contexts != null) {
                 // Lazily build the context list
                 if (contexts == null) {
                     int size = operations.size();
@@ -383,7 +398,8 @@ public class BulkIngester<Context> implements AutoCloseable {
         // Flush buffered operations
         flush();
         // and wait for all requests to be completed
-        closeCondition.whenReady(() -> {});
+        closeCondition.whenReady(() -> {
+        });
 
         if (flushTask != null) {
             flushTask.cancel(false);
@@ -404,7 +420,7 @@ public class BulkIngester<Context> implements AutoCloseable {
         private ElasticsearchAsyncClient client;
         private BulkRequest globalSettings;
         private int bulkOperations = 1000;
-        private long bulkSize = 5*1024*1024;
+        private long bulkSize = 5 * 1024 * 1024;
         private int maxConcurrentRequests = 1;
         private Long flushIntervalMillis;
         private BulkListener<Context> listener;
@@ -452,14 +468,15 @@ public class BulkIngester<Context> implements AutoCloseable {
         }
 
         /**
-         * Sets the number of concurrent requests allowed to be executed. A value of 1 means 1 request is allowed to be executed
+         * Sets the number of concurrent requests allowed to be executed. A value of 0 means that only a single
+         * request will be allowed to be executed. A value of 1 means 1 concurrent request is allowed to be executed
          * while accumulating new bulk requests. Defaults to {@code 1}.
          *
-         * @throws IllegalArgumentException if less than 1.
+         * @throws IllegalArgumentException if less than 0.
          */
         public Builder<Context> maxConcurrentRequests(int max) {
-            if (max < 1) {
-                throw new IllegalArgumentException("Max concurrent request should be at least 1");
+            if (max < 0) {
+                throw new IllegalArgumentException("Max concurrent request should be at least 0");
             }
             this.maxConcurrentRequests = max;
             return this;
@@ -483,7 +500,7 @@ public class BulkIngester<Context> implements AutoCloseable {
         /**
          * Sets an interval flushing any bulk actions pending if the interval passes. Defaults to not set.
          * <p>
-         * Flushing is still subject to the maximum number of requests set with {@link #maxConcurrentRequests}.     
+         * Flushing is still subject to the maximum number of requests set with {@link #maxConcurrentRequests}.
          */
         public Builder<Context> flushInterval(long value, TimeUnit unit, ScheduledExecutorService scheduler) {
             this.scheduler = scheduler;
